@@ -16,6 +16,7 @@ class PrintListItem(Gtk.FlowBoxChild):
         self.info_label = None
         self.icon = None
         self.thumb_loaded = False
+        self.metadata_requested = False
 
     def set_date(self, date):
         self.date = date

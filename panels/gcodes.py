@@ -23,6 +23,11 @@ def format_label(widget):
 
 
 class Panel(ScreenPanel):
+    # Rows created per main loop iteration while filling the list.
+    BUILD_CHUNK = 25
+    # Pixels above and below the viewport that still count as visible.
+    OVERSCAN = 300
+
     def __init__(self, screen, title):
         title = title or (_("Print") if self._printer.extrudercount > 0 else _("Gcodes"))
         super().__init__(screen, title)
@@ -46,6 +51,16 @@ class Panel(ScreenPanel):
         # flowbox, which is O(files x children) while metadata is streaming in.
         self.items = {}
         self._sort_pending = False
+        # Rows waiting for their thumbnail and metadata, filled as they scroll
+        # into view. Requesting them for a whole directory up front is what made
+        # opening a large gcodes folder slow.
+        self.unloaded = []
+        self._visible_pending = False
+        # Bumped on every refresh so an in-flight chunked build is abandoned.
+        self._build_generation = 0
+        self._build_queue = []
+        self._build_index = 0
+        self._build_start = None
         self.list_button_size = self._gtk.img_scale * self.bts
 
         self.headerbox = Gtk.Box(hexpand=True, vexpand=False)
@@ -98,6 +113,8 @@ class Panel(ScreenPanel):
 
         self.scroll = self._gtk.ScrolledWindow()
         self.scroll.add(self.flowbox)
+        self.scroll.get_vadjustment().connect("value-changed", self.queue_visible)
+        self.flowbox.connect("size-allocate", self.queue_visible)
 
         self.main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
         self.main.add(self.headerbox)
@@ -193,7 +210,7 @@ class Panel(ScreenPanel):
             row.attach(delete, 3, 1, 1, 1)
             if is_file:
                 icon.connect("clicked", self.confirm_print, path)
-                self.image_load(path, icon, self.thumbsize / 2, True, "file")
+                self.set_placeholder(icon, self.thumbsize / 2, "file")
                 delete.connect("clicked", self.confirm_delete_file, f"gcodes/{path}")
                 rename.connect("clicked", self.show_rename, f"gcodes/{path}")
                 action_icon = "printer" if self._printer.extrudercount > 0 else "load"
@@ -209,7 +226,7 @@ class Panel(ScreenPanel):
                     row.attach(icon, 4, 0, 1, 2)
             elif is_dir:
                 icon.connect("clicked", self.change_dir, path)
-                self.image_load(None, icon, self.thumbsize / 2, True, "folder")
+                self.set_placeholder(icon, self.thumbsize / 2, "folder")
                 delete.connect("clicked", self.confirm_delete_directory, path)
                 rename.connect("clicked", self.show_rename, path)
                 action = self._gtk.Button("load", style="color3")
@@ -225,13 +242,14 @@ class Panel(ScreenPanel):
             icon = self._gtk.Button(label=basename)
             if is_file:
                 icon.connect("clicked", self.confirm_print, path)
-                self.image_load(path, icon, self.thumbsize, False, "file")
+                self.set_placeholder(icon, self.thumbsize, "file")
             elif is_dir:
                 icon.connect("clicked", self.change_dir, path)
-                self.image_load(None, icon, self.thumbsize, False, "folder")
+                self.set_placeholder(icon, self.thumbsize, "folder")
             fbchild.icon = icon
             fbchild.add(icon)
-        fbchild.thumb_loaded = is_file and self._screen.files.has_thumbnail(path)
+        if is_file:
+            self.unloaded.append(fbchild)
         return fbchild
 
     def show_path(self):
@@ -242,10 +260,12 @@ class Panel(ScreenPanel):
             self.labels["path"].set_text(self.cur_directory)
             self.labels["path"].show()
 
-    def image_load(self, filepath, widget, size=-1, small=True, iconname=None):
+    def set_placeholder(self, widget, size, iconname):
         widget.set_image(self._gtk.Image(iconname, size, size))
         format_label(widget)
 
+    def image_load(self, filepath, widget, size=-1, small=True, iconname=None):
+        self.set_placeholder(widget, size, iconname)
         self.load_image_async(
             filepath,
             size,
@@ -515,7 +535,6 @@ class Panel(ScreenPanel):
                 )
 
     def load_files(self, result, method, params):
-        start = datetime.now()
         self.set_loading(True)
         if not result.get("result") or not isinstance(result["result"], dict):
             logging.info(result)
@@ -523,29 +542,84 @@ class Panel(ScreenPanel):
             return
 
         items = [*result["result"]["dirs"], *result["result"]["files"]]
-        total = len(items)
-
-        if total == 0:
+        if not items:
             self.set_loading(False)
             return
 
-        for item in items:
+        # Building a few thousand rows in one go freezes the UI for seconds, so
+        # spread the work over the main loop and let it draw in between.
+        self._build_start = datetime.now()
+        self._build_queue = items
+        self._build_index = 0
+        self._build_generation += 1
+        self.set_sort()
+        GLib.idle_add(self.build_chunk, self._build_generation)
+
+    def build_chunk(self, generation):
+        if generation != self._build_generation:
+            return False
+        end = min(self._build_index + self.BUILD_CHUNK, len(self._build_queue))
+        for item in self._build_queue[self._build_index : end]:
             fbchild = self.create_item(item)
             if fbchild is not None:
                 self.items[fbchild.get_path()] = fbchild
                 self.flowbox.add(fbchild)
-
-        self.load_metadata(self.items.values())
-        self.set_sort()
-        self.set_loading(False)
-        elapsed = (datetime.now() - start).total_seconds()
+                fbchild.show_all()
+        first_chunk = self._build_index == 0
+        self._build_index = end
+        if first_chunk:
+            # Hand the list over as soon as there is something to look at.
+            self.set_loading(False)
+        self.queue_visible()
+        if end < len(self._build_queue):
+            return True
+        total = len(self._build_queue)
+        self._build_queue = []
+        elapsed = (datetime.now() - self._build_start).total_seconds()
         logging.info(f"Loaded {total} items in {elapsed:.3f} seconds")
+        return False
 
-    def load_metadata(self, children):
-        for child in children:
-            if child.get_is_dir():
+    def queue_visible(self, *args):
+        if self._visible_pending or not self.unloaded:
+            return
+        self._visible_pending = True
+        GLib.idle_add(self.load_visible)
+
+    def load_visible(self):
+        self._visible_pending = False
+        if not self.unloaded:
+            return False
+        adjustment = self.scroll.get_vadjustment()
+        base = self.flowbox.get_allocation().y
+        top = adjustment.get_value() - self.OVERSCAN
+        bottom = adjustment.get_value() + adjustment.get_page_size() + self.OVERSCAN
+        still_unloaded = []
+        for child in self.unloaded:
+            if child.get_parent() is None:
+                # Removed by a delete or move event, drop it from the queue.
                 continue
-            self._screen.files.request_metadata(child.get_path())
+            allocation = child.get_allocation()
+            if allocation.height <= 1:
+                # Not allocated yet, the size-allocate handler will come back.
+                still_unloaded.append(child)
+                continue
+            y = allocation.y - base
+            if y + allocation.height < top or y > bottom:
+                still_unloaded.append(child)
+                continue
+            self.load_child(child)
+        self.unloaded = still_unloaded
+        return False
+
+    def load_child(self, child):
+        path = child.get_path()
+        if not child.metadata_requested:
+            child.metadata_requested = True
+            self._screen.files.request_metadata(path)
+        if not child.thumb_loaded and self._screen.files.has_thumbnail(path):
+            child.thumb_loaded = True
+            size = self.thumbsize / 2 if self.list_mode else self.thumbsize
+            self.image_load(path, child.icon, size, self.list_mode, "file")
 
     def find_child(self, path):
         return self.items.get(path) or self.items.get(f"gcodes/{path}")
@@ -585,11 +659,10 @@ class Panel(ScreenPanel):
         if fbchild.info_label is not None:
             fileinfo = self._screen.files.get_file_info(path)
             fbchild.info_label.set_markup(self.get_info_str(fileinfo or item, path))
-        if fbchild.icon is not None and (changed or not fbchild.thumb_loaded):
-            if self._screen.files.has_thumbnail(path):
-                fbchild.thumb_loaded = True
-                size = self.thumbsize / 2 if self.list_mode else self.thumbsize
-                self.image_load(path, fbchild.icon, size, self.list_mode, "file")
+        if changed:
+            fbchild.thumb_loaded = False
+        if fbchild.icon is not None and not fbchild.thumb_loaded:
+            self.load_child(fbchild)
         if changed and self.sort_current[0] in {"date", "size"}:
             self.queue_sort()
 
@@ -639,11 +712,14 @@ class Panel(ScreenPanel):
         self.set_loading(True)
         # Dropping the sort func first stops every removal from resorting, and
         # destroying releases the widgets instead of leaving them to the GC.
+        self._build_generation += 1
+        self._build_queue = []
         self.flowbox.set_sort_func(None)
         for child in self.flowbox.get_children():
             self.flowbox.remove(child)
             child.destroy()
         self.items.clear()
+        self.unloaded.clear()
         self._screen._ws.api.get_dir_info(self.load_files, self.cur_directory)
 
     def set_loading(self, loading):
