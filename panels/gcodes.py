@@ -6,7 +6,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from datetime import datetime
 
-from gi.repository import Gtk, Pango
+from gi.repository import GLib, Gtk, Pango
 
 from ks_includes.KlippyGtk import find_widget
 from ks_includes.screen_panel import ScreenPanel
@@ -42,6 +42,10 @@ class Panel(ScreenPanel):
         self.showing_rename = False
         self.loading = False
         self.cur_directory = "gcodes"
+        # path -> PrintListItem, so file events do not need a linear scan of the
+        # flowbox, which is O(files x children) while metadata is streaming in.
+        self.items = {}
+        self._sort_pending = False
         self.list_button_size = self._gtk.img_scale * self.bts
 
         self.headerbox = Gtk.Box(hexpand=True, vexpand=False)
@@ -214,6 +218,8 @@ class Panel(ScreenPanel):
                 action.set_vexpand(False)
                 action.set_halign(Gtk.Align.END)
                 row.attach(action, 4, 0, 1, 2)
+            fbchild.info_label = info
+            fbchild.icon = icon
             fbchild.add(row)
         else:  # Thumbnail view
             icon = self._gtk.Button(label=basename)
@@ -223,7 +229,9 @@ class Panel(ScreenPanel):
             elif is_dir:
                 icon.connect("clicked", self.change_dir, path)
                 self.image_load(None, icon, self.thumbsize, False, "folder")
+            fbchild.icon = icon
             fbchild.add(icon)
+        fbchild.thumb_loaded = is_file and self._screen.files.has_thumbnail(path)
         return fbchild
 
     def show_path(self):
@@ -377,6 +385,10 @@ class Panel(ScreenPanel):
 
         info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
         fileinfo_data = self._screen.files.get_file_info(filename)
+        if not fileinfo_data:
+            # Metadata is fetched lazily, make sure it is on its way for a file
+            # the user is actually interested in.
+            self._screen.files.request_metadata(filename)
         fileinfo_text = self.get_file_info_extended(fileinfo_data)
         fileinfo = Gtk.Label(
             label=fileinfo_text,
@@ -520,42 +532,97 @@ class Panel(ScreenPanel):
         for item in items:
             fbchild = self.create_item(item)
             if fbchild is not None:
+                self.items[fbchild.get_path()] = fbchild
                 self.flowbox.add(fbchild)
 
+        self.load_metadata(self.items.values())
         self.set_sort()
         self.set_loading(False)
         elapsed = (datetime.now() - start).total_seconds()
         logging.info(f"Loaded {total} items in {elapsed:.3f} seconds")
 
+    def load_metadata(self, children):
+        for child in children:
+            if child.get_is_dir():
+                continue
+            self._screen.files.request_metadata(child.get_path())
+
+    def find_child(self, path):
+        return self.items.get(path) or self.items.get(f"gcodes/{path}")
+
     def delete_from_list(self, path):
-        logging.info(f"deleting {path}")
-        for item in self.flowbox.get_children():
-            if item.get_path() in {path, f"gcodes/{path}"}:
-                logging.info("found removing")
-                self.flowbox.remove(item)
+        for key in (path, f"gcodes/{path}"):
+            child = self.items.pop(key, None)
+            if child is not None:
+                logging.debug(f"deleting {key}")
+                self.flowbox.remove(child)
+                child.destroy()
                 return True
+        return False
+
+    def queue_sort(self):
+        # Metadata replies arrive one per file, coalesce the resorts they cause
+        # into a single pass instead of one n log n sort per reply.
+        if self._sort_pending:
+            return
+        self._sort_pending = True
+        GLib.idle_add(self._do_sort)
+
+    def _do_sort(self):
+        self._sort_pending = False
+        self.flowbox.invalidate_sort()
+        return False
+
+    def update_item(self, fbchild, item):
+        path = fbchild.get_path()
+        changed = False
+        if "modified" in item and item["modified"] != fbchild.get_date():
+            fbchild.set_date(item["modified"])
+            changed = True
+        if "size" in item and item["size"] != fbchild.get_size():
+            fbchild.set_size(item["size"])
+            changed = True
+        if fbchild.info_label is not None:
+            fileinfo = self._screen.files.get_file_info(path)
+            fbchild.info_label.set_markup(self.get_info_str(fileinfo or item, path))
+        if fbchild.icon is not None and (changed or not fbchild.thumb_loaded):
+            if self._screen.files.has_thumbnail(path):
+                fbchild.thumb_loaded = True
+                size = self.thumbsize / 2 if self.list_mode else self.thumbsize
+                self.image_load(path, fbchild.icon, size, self.list_mode, "file")
+        if changed and self.sort_current[0] in {"date", "size"}:
+            self.queue_sort()
 
     def add_item_from_callback(self, action, data):
         item = data["item"]
-        if "source_item" in data:
-            self.delete_from_list(data["source_item"]["path"])
-        else:
-            self.delete_from_list(item["path"])
+        old_path = data["source_item"]["path"] if "source_item" in data else item["path"]
         path = os.path.join("gcodes", item["path"])
-        if self.cur_directory != os.path.dirname(path):
+        in_cur_dir = self.cur_directory == os.path.dirname(path)
+
+        existing = self.find_child(old_path)
+        if existing is not None and in_cur_dir and action == "modify_file":
+            # Metadata landed for a row that is already on screen. Refresh it in
+            # place, rebuilding the widget here is what makes a large directory
+            # take O(n^2) to settle.
+            self.update_item(existing, item)
             return
-        if action in {"create_dir", "move_dir"}:
-            item.update({"path": path, "dirname": os.path.split(item["path"])[1]})
-        else:
-            item.update({"path": path, "filename": os.path.split(item["path"])[1]})
+        self.delete_from_list(old_path)
+        if not in_cur_dir:
+            return
+        # Copy before rewriting the path, for modify_file `item` is the record
+        # held in KlippyFiles and prefixing it corrupts the store.
+        item = dict(item)
+        key = "dirname" if action in {"create_dir", "move_dir"} else "filename"
+        item.update({"path": path, key: os.path.split(item["path"])[1]})
         fbchild = self.create_item(item)
         if fbchild:
+            self.items[fbchild.get_path()] = fbchild
             self.flowbox.add(fbchild)
-            self.flowbox.invalidate_sort()
-            self.flowbox.show_all()
+            self.queue_sort()
+            fbchild.show_all()
 
     def _callback(self, action, data):
-        logging.info(f"{action}: {data}")
+        logging.debug(f"{action}: {data.get('item', {}).get('path')}")
         if action in {"create_dir", "create_file"}:
             self.add_item_from_callback(action, data)
         elif action == "delete_file":
@@ -570,8 +637,13 @@ class Panel(ScreenPanel):
     def _refresh_files(self, *args):
         logging.info("Refreshing")
         self.set_loading(True)
+        # Dropping the sort func first stops every removal from resorting, and
+        # destroying releases the widgets instead of leaving them to the GC.
+        self.flowbox.set_sort_func(None)
         for child in self.flowbox.get_children():
             self.flowbox.remove(child)
+            child.destroy()
+        self.items.clear()
         self._screen._ws.api.get_dir_info(self.load_files, self.cur_directory)
 
     def set_loading(self, loading):

@@ -13,11 +13,13 @@ class KlippyFiles:
         self.files = {}
         self.directories = []
         self.gcodes_path = None
+        self.requested_metadata = set()
 
     def reinit(self):
         self.callbacks.clear()
         self.files.clear()
         self.directories.clear()
+        self.requested_metadata.clear()
         self.gcodes_path = None
 
     def set_gcodes_path(self):
@@ -29,11 +31,18 @@ class KlippyFiles:
     def _callback(self, result, method, params):
         if "error" in result:
             logging.debug(result["error"])
+            if method == "server.files.metadata":
+                self.requested_metadata.discard(params["filename"])
             return
         if method == "server.files.list":
+            # Only index the listing, metadata is fetched on demand by whatever
+            # displays the file. Requesting it for every file makes startup with
+            # a large gcodes directory take tens of seconds.
             for item in result["result"]:
-                self.files[item["path"]] = item
-                self.request_metadata(item["path"])
+                if item["path"] in self.files:
+                    self.files[item["path"]].update(item)
+                else:
+                    self.files[item["path"]] = item
         elif method == "server.files.metadata":
             for x in result["result"]:
                 if params["filename"] not in self.files:
@@ -69,11 +78,12 @@ class KlippyFiles:
             logging.info(f"Error adding item, unknown path: {item}")
             return
         self.files[item["path"]] = item
-        self.request_metadata(item["path"])
+        self.request_metadata(item["path"], force=True)
 
     def remove_file(self, filename):
         if filename in self.files:
             self.files.pop(filename)
+        self.requested_metadata.discard(filename)
 
     def add_callback(self, callback):
         self.callbacks.append(callback)
@@ -97,10 +107,11 @@ class KlippyFiles:
         elif data["action"] == "delete_file":
             self.remove_file(data["item"]["path"])
         elif data["action"] == "modify_file":
-            self.request_metadata(data["item"]["path"])
+            self.request_metadata(data["item"]["path"], force=True)
         elif data["action"] == "move_file":
             self.files[data["item"]["path"]] = self.files.pop(data["source_item"]["path"])
             self.files[data["item"]["path"]].update(data["item"])
+            self.requested_metadata.discard(data["source_item"]["path"])
         self.run_callbacks(data["action"], data)
 
     @staticmethod
@@ -120,13 +131,19 @@ class KlippyFiles:
     def has_thumbnail(self, filename):
         return filename in self.files and "thumbnails" in self.files[filename]
 
-    def request_metadata(self, filename):
-        if self.is_gcode(filename):
-            self._screen._ws.api.get_file_metadata(filename, self._callback)
-        else:
-            logging.info("Not a gcode")
+    def request_metadata(self, filename, force=False):
+        if not self.is_gcode(filename):
+            logging.debug(f"Not a gcode: {filename}")
+            return
+        if force:
+            self.requested_metadata.discard(filename)
+        elif filename in self.requested_metadata:
+            return
+        self.requested_metadata.add(filename)
+        self._screen._ws.api.get_file_metadata(filename, self._callback)
 
     def refresh_files(self):
+        self.requested_metadata.clear()
         self._screen._ws.api.get_file_list(self._callback)
 
     def run_callbacks(self, action, item):
@@ -135,8 +152,7 @@ class KlippyFiles:
 
     def get_file_info(self, path):
         if path not in self.files:
-            logging.info(f"Metadata not found {path}")
-            self.request_metadata(path)
+            logging.debug(f"Metadata not found {path}")
             return {}
         return self.files[path]
 

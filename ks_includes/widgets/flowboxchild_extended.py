@@ -11,6 +11,11 @@ class PrintListItem(Gtk.FlowBoxChild):
         self.size = None
         self.dir = 0
         self.path = None
+        # Widgets the panel refreshes in place when metadata arrives, so a
+        # metadata update does not have to rebuild the whole row.
+        self.info_label = None
+        self.icon = None
+        self.thumb_loaded = False
 
     def set_date(self, date):
         self.date = date
