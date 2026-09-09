@@ -9,10 +9,6 @@ class KlippyGcodes:
         return f"M140 S{temp}"
 
     @staticmethod
-    def set_ext_temp(temp, tool=0):
-        return f"M104 T{tool} S{temp}"
-
-    @staticmethod
     def set_heater_temp(heater, temp):
         return f'SET_HEATER_TEMPERATURE heater="{heater}" target={temp}'
 

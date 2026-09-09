@@ -99,11 +99,14 @@ class MoonrakerApi:
             *args,
         )
 
-    def set_tool_temp(self, tool, target, callback=None, *args):
-        logging.debug(f"Sending set_tool_temp: {KlippyGcodes.set_ext_temp(target, tool)}")
+    def set_tool_temp(self, extruder, target, callback=None, *args):
+        # Address the heater by name instead of M104 T<n>: the T parameter is
+        # reinterpreted by some add-ons (AFC maps it to a lane), which can
+        # silently drop the temperature change.
+        logging.debug(f"Sending set_tool_temp: {KlippyGcodes.set_heater_temp(extruder, target)}")
         return self._ws.send_method(
             "printer.gcode.script",
-            {"script": KlippyGcodes.set_ext_temp(target, tool)},
+            {"script": KlippyGcodes.set_heater_temp(extruder, target)},
             callback,
             *args,
         )

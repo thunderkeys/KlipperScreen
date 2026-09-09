@@ -152,9 +152,7 @@ class Panel(ScreenPanel):
                     target -= int(self.tempdelta)
                     target = max(target, 0)
                 if heater.startswith("extruder"):
-                    self._screen._ws.api.set_tool_temp(
-                        self._printer.get_tool_number(heater), target
-                    )
+                    self._screen._ws.api.set_tool_temp(heater, target)
                 elif heater.startswith("heater_bed"):
                     self._screen._ws.api.set_bed_temp(target)
                 elif heater.startswith("heater_generic "):
@@ -272,9 +270,7 @@ class Panel(ScreenPanel):
                     target = 0
                 if heater.startswith("extruder"):
                     if self.validate(heater, target, max_temp):
-                        self._screen._ws.api.set_tool_temp(
-                            self._printer.get_tool_number(heater), target
-                        )
+                        self._screen._ws.api.set_tool_temp(heater, target)
                 elif heater.startswith("heater_bed"):
                     if target is None:
                         with suppress(KeyError):
@@ -447,9 +443,7 @@ class Panel(ScreenPanel):
             return
 
         if self.active_heater.startswith("extruder"):
-            self._screen._ws.api.set_tool_temp(
-                self._printer.get_tool_number(self.active_heater), temp
-            )
+            self._screen._ws.api.set_tool_temp(self.active_heater, temp)
         elif self.active_heater == "heater_bed":
             self._screen._ws.api.set_bed_temp(temp)
         elif self.active_heater.startswith("heater_generic "):
